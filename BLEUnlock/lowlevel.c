@@ -5,6 +5,12 @@
 void wakeDisplay(void)
 {
     static IOPMAssertionID assertionID;
+    // Each declare without a matching release leaks a power assertion;
+    // wake retries arrive 1s apart, so drop the previous one first.
+    if (assertionID) {
+        IOPMAssertionRelease(assertionID);
+        assertionID = 0;
+    }
     IOPMAssertionDeclareUserActivity(CFSTR("BLEUnlock"), kIOPMUserActiveLocal, &assertionID);
 }
 

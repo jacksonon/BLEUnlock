@@ -52,6 +52,9 @@ class Device: NSObject {
     var scanTimer: Timer?
     var macAddr: String?
     var blName: String?
+    // Outstanding DeviceInformation reads; when it drains to zero the GATT
+    // connection has served its purpose and can be dropped (see BLE).
+    var pendingInfoReads = 0
     // Set after the first (expensive) name/MAC resolution attempt so
     // description doesn't re-read the Bluetooth plist / SQLite DBs on every
     // advertisement. Device lifetime is bounded by the scan eviction timer,
@@ -315,6 +318,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         resetSignalTimer()
     }
 
+    func evictDevice(_ device: Device) {
+        delegate?.removeDevice(device: device)
+        if let p = device.peripheral {
+            centralMgr.cancelPeripheralConnection(p)
+        }
+        device.scanTimer?.invalidate()
+        device.scanTimer = nil
+        devices.removeValue(forKey: device.uuid)
+    }
+
     func resetScanTimer(device: Device) {
         // Same churn avoidance as resetSignalTimer: advertisements arrive
         // continuously, so keep the armed eviction timer while it's fresh.
@@ -327,12 +340,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         // the timer, so strong captures would pin both until firing.
         device.scanTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { [weak self, weak device] _ in
             guard let self = self, let device = device else { return }
-            self.delegate?.removeDevice(device: device)
-            if let p = device.peripheral {
-                self.centralMgr.cancelPeripheralConnection(p)
-            }
-            device.scanTimer = nil
-            self.devices.removeValue(forKey: device.uuid)
+            self.evictDevice(device)
         })
         if let timer = device.scanTimer {
             RunLoop.main.add(timer, forMode: .common)
@@ -370,10 +378,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let rawRSSI = RSSI.intValue
         let rssiValid = RSSIFilter.isValidSample(rawRSSI)
         if let uuid = monitoredUUID {
-            if peripheral.identifier.description == uuid.description {
-                if monitoredPeripheral == nil {
-                    monitoredPeripheral = peripheral
-                }
+            if peripheral.identifier == uuid {
+                // Refresh: CoreBluetooth may hand out a new instance for a
+                // returning device; active polling and RSSI guards track this
+                // reference, so a stale one would silently drop updates.
+                monitoredPeripheral = peripheral
                 if activeModeTimer == nil && rssiValid {
                     //print("Discover \(rawRSSI)dBm")
                     updateMonitoredPeripheral(rawRSSI)
@@ -401,7 +410,15 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     device.rssi = rawRSSI
                     delegate?.updateDevice(device: device)
                 }
-                resetScanTimer(device: device)
+                // Prune far-away devices early (10dB hysteresis below the
+                // listing threshold) instead of holding a GATT connection
+                // until the 60s eviction timer fires. Never prune the
+                // monitored peripheral's own connection.
+                if rssiValid && rawRSSI < thresholdRSSI - 10 && device.peripheral !== monitoredPeripheral {
+                    evictDevice(device)
+                } else {
+                    resetScanTimer(device: device)
+                }
             } else if rssiValid && rawRSSI >= thresholdRSSI {
                 // Bogus readings (e.g. positive values some stacks report on
                 // error) must not pass the threshold gate or pollute the list.
@@ -499,12 +516,25 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverServices error: Error?) {
+        guard error == nil else {
+            centralMgr.cancelPeripheralConnection(peripheral)
+            return
+        }
+        var found = false
         if let services = peripheral.services {
             for service in services {
                 if service.uuid == DeviceInformation {
+                    found = true
                     peripheral.discoverCharacteristics([ManufacturerName, ModelName], for: service)
                 }
             }
+        }
+        // No DeviceInformation service: nothing more to learn from this
+        // device, so don't hold a GATT connection open until eviction.
+        // The monitored peripheral is exempt — its connection is managed
+        // by the active/passive polling logic.
+        if !found && peripheral !== monitoredPeripheral {
+            centralMgr.cancelPeripheralConnection(peripheral)
         }
     }
 
@@ -512,12 +542,30 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?)
     {
+        guard error == nil else {
+            if peripheral !== monitoredPeripheral {
+                centralMgr.cancelPeripheralConnection(peripheral)
+            }
+            return
+        }
+        // Count the reads we're about to issue so didUpdateValueFor knows
+        // when everything learnable has arrived and can drop the connection.
+        // (Waiting for "both values non-nil" instead would strand devices
+        // that expose only one of the two characteristics.)
+        var wanted = 0
         if let chars = service.characteristics {
             for chara in chars {
                 if chara.uuid == ManufacturerName || chara.uuid == ModelName {
+                    wanted += 1
                     peripheral.readValue(for:chara)
                 }
             }
+        }
+        if let device = devices[peripheral.identifier] {
+            device.pendingInfoReads = wanted
+        }
+        if wanted == 0 && peripheral !== monitoredPeripheral {
+            centralMgr.cancelPeripheralConnection(peripheral)
         }
     }
     
@@ -525,23 +573,24 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?)
     {
+        guard characteristic.uuid == ManufacturerName || characteristic.uuid == ModelName else { return }
+        guard let device = devices[peripheral.identifier] else { return }
+        device.pendingInfoReads -= 1
         if let value = characteristic.value {
             let str: String? = String(data: value, encoding: .utf8)
             if let s = str {
-                if let device = devices[peripheral.identifier] {
-                    if characteristic.uuid == ManufacturerName {
-                        device.manufacture = s
-                        delegate?.updateDevice(device: device)
-                    }
-                    if characteristic.uuid == ModelName {
-                        device.model = s
-                        delegate?.updateDevice(device: device)
-                    }
-                    if device.model != nil && device.model != nil && device.peripheral != monitoredPeripheral {
-                        centralMgr.cancelPeripheralConnection(peripheral)
-                    }
+                if characteristic.uuid == ManufacturerName {
+                    device.manufacture = s
+                    delegate?.updateDevice(device: device)
+                }
+                if characteristic.uuid == ModelName {
+                    device.model = s
+                    delegate?.updateDevice(device: device)
                 }
             }
+        }
+        if device.pendingInfoReads <= 0 && device.peripheral !== monitoredPeripheral {
+            centralMgr.cancelPeripheralConnection(peripheral)
         }
     }
     
