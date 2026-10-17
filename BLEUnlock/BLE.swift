@@ -36,27 +36,36 @@ class Device: NSObject {
     var scanTimer: Timer?
     var macAddr: String?
     var blName: String?
+    // Set after the first (expensive) name/MAC resolution attempt so
+    // description doesn't re-read the Bluetooth plist / SQLite DBs on every
+    // advertisement. Device lifetime is bounded by the scan eviction timer,
+    // so entries are re-resolved when rediscovered.
+    var resolvedDeviceInfo = false
     
     override var description: String {
         get {
-            if macAddr == nil || blName == nil {
-                if let info = getLEDeviceInfoFromUUID(uuid.description) {
-                    blName = info.name
-                    macAddr = info.macAddr
+            // Resolve Bluetooth names/MACs only once per device. description is
+            // evaluated on every advertisement, and the lookups below hit the
+            // filesystem (plist + SQLite). The cached values are used below.
+            if !resolvedDeviceInfo {
+                resolvedDeviceInfo = true
+                if macAddr == nil || blName == nil {
+                    if let info = getLEDeviceInfoFromUUID(uuid.description) {
+                        blName = info.name
+                        macAddr = info.macAddr
+                    }
                 }
-            }
-            if macAddr == nil {
-                macAddr = getMACFromUUID(uuid.description)
-            }
-            if let mac = macAddr {
-                if blName == nil {
+                if macAddr == nil {
+                    macAddr = getMACFromUUID(uuid.description)
+                }
+                if let mac = macAddr, blName == nil {
                     blName = getNameFromMAC(mac)
                 }
-                if let name = blName {
-                    // If it's just "iPhone" or "iPad", there's a chance we can get the model name in the following code
-                    if name != "iPhone" && name != "iPad" {
-                        return name
-                    }
+            }
+            if macAddr != nil, let name = blName {
+                // If it's just "iPhone" or "iPad", there's a chance we can get the model name in the following code
+                if name != "iPhone" && name != "iPad" {
+                    return name
                 }
             }
             if let manu = manufacture {
@@ -186,7 +195,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func resetSignalTimer() {
         signalTimer?.invalidate()
-        signalTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { _ in
+        signalTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { [weak self] _ in
+            guard let self = self else { return }
             print("Device is lost")
             self.delegate?.updateRSSI(rssi: nil, active: false)
             if self.presence {
@@ -251,7 +261,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 proximityTimer = nil
             }
         } else if presence && proximityTimer == nil {
-            proximityTimer = Timer.scheduledTimer(withTimeInterval: proximityTimeout, repeats: false, block: { _ in
+            proximityTimer = Timer.scheduledTimer(withTimeInterval: proximityTimeout, repeats: false, block: { [weak self] _ in
+                guard let self = self else { return }
                 print("Device is away")
                 self.presence = false
                 self.delegate?.updatePresence(presence: self.presence, reason: "away")
@@ -265,11 +276,15 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func resetScanTimer(device: Device) {
         device.scanTimer?.invalidate()
-        device.scanTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { _ in
+        // Weak captures: the run loop retains the timer and the device retains
+        // the timer, so strong captures would pin both until firing.
+        device.scanTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { [weak self, weak device] _ in
+            guard let self = self, let device = device else { return }
             self.delegate?.removeDevice(device: device)
             if let p = device.peripheral {
                 self.centralMgr.cancelPeripheralConnection(p)
             }
+            device.scanTimer = nil
             self.devices.removeValue(forKey: device.uuid)
         })
         if let timer = device.scanTimer {
@@ -288,7 +303,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         print("Connecting")
         centralMgr.connect(p, options: nil)
         connectionTimer?.invalidate()
-        connectionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false, block: { _ in
+        connectionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false, block: { [weak self, weak p] _ in
+            guard let self = self, let p = p else { return }
             if p.state == .connecting {
                 print("Connection timeout")
                 self.centralMgr.cancelPeripheralConnection(p)
@@ -343,8 +359,13 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 }
             } else {
                 device = dev!
-                device.rssi = rssi
-                delegate?.updateDevice(device: device)
+                // Duplicate advertisements arrive continuously; the menu title
+                // only shows the RSSI, so skip the (expensive) UI refresh when
+                // nothing changed. The eviction timer is still reset below.
+                if device.rssi != rssi {
+                    device.rssi = rssi
+                    delegate?.updateDevice(device: device)
+                }
             }
             resetScanTimer(device: device)
         }
@@ -381,7 +402,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             if !scanMode {
                 centralMgr.stopScan()
             }
-            activeModeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true, block: { _ in
+            activeModeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true, block: { [weak self, weak peripheral] timer in
+                guard let self = self, let peripheral = peripheral else {
+                    timer.invalidate()
+                    return
+                }
                 if Date().timeIntervalSince1970 > self.lastReadAt + 10 {
                     print("Falling back to passive mode")
                     self.centralMgr.cancelPeripheralConnection(peripheral)

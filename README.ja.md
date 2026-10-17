@@ -20,7 +20,7 @@ BLEUnlockはiPhone, Apple Watchやその他のBluetooth Low Energyデバイス�
 ## 必要なもの
 
 - Bluetooth Low EnergyをサポートするMac
-- macOS 10.13 (High Sierra) 以上
+- macOS 12.0 (Monterey) 以上
 - iPhone 5s以上, Apple Watch (すべて), または定期的に信号を[静的なMACアドレス](#macアドレスについて)から送信するBLEデバイス
 
 ## インストール
