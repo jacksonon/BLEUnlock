@@ -1,21 +1,37 @@
 import Foundation
 import CoreBluetooth
-import Accelerate
 
 let DeviceInformation = CBUUID(string:"180A")
 let ManufacturerName = CBUUID(string:"2A29")
 let ModelName = CBUUID(string:"2A24")
 let ExposureNotification = CBUUID(string:"FD6F")
 
+private var cachedBluetoothPlist: NSDictionary?
+private var cachedBluetoothPlistMtime: Date?
+
+/// The system Bluetooth plist is re-read on every device lookup; cache it in
+/// memory and only re-read when the file actually changed.
+func bluetoothPlist() -> NSDictionary? {
+    let path = "/Library/Preferences/com.apple.Bluetooth.plist"
+    let mtime = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date
+    if let m = mtime, let cached = cachedBluetoothPlist, cachedBluetoothPlistMtime == m {
+        return cached
+    }
+    guard let plist = NSDictionary(contentsOfFile: path) else { return nil }
+    cachedBluetoothPlist = plist
+    cachedBluetoothPlistMtime = mtime
+    return plist
+}
+
 func getMACFromUUID(_ uuid: String) -> String? {
-    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let plist = bluetoothPlist() else { return nil }
     guard let cbcache = plist["CoreBluetoothCache"] as? NSDictionary else { return nil }
     guard let device = cbcache[uuid] as? NSDictionary else { return nil }
     return device["DeviceAddress"] as? String
 }
 
 func getNameFromMAC(_ mac: String) -> String? {
-    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let plist = bluetoothPlist() else { return nil }
     guard let devcache = plist["DeviceCache"] as? NSDictionary else { return nil }
     guard let device = devcache[mac] as? NSDictionary else { return nil }
     if let name = device["Name"] as? String {
@@ -144,8 +160,12 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var powerWarn = true
     var passiveMode = false
     var thresholdRSSI = -70
-    var latestRSSIs: [Double] = []
-    var latestN: Int = 5
+    var rssiFilter = RSSIFilter()
+    var lastEstimatedRSSI: Int? = nil
+    // Throttle for updateRSSI: the menu title is the only consumer.
+    var lastReportedRSSI: Int? = nil
+    var lastReportedActive = false
+    var lastReportAt = 0.0
     var activeModeTimer : Timer? = nil
     var connectionTimer : Timer? = nil
 
@@ -190,14 +210,26 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         monitoredPeripheral = nil
         activeModeTimer?.invalidate()
         activeModeTimer = nil
+        // Drop smoothing/report state from any previously monitored device.
+        rssiFilter.reset()
+        lastEstimatedRSSI = nil
+        lastReportedRSSI = nil
         scanForPeripherals()
     }
 
     func resetSignalTimer() {
+        // Advertisements arrive at ~10Hz; recreating a 60s timer on every
+        // one is pure churn. Reuse the armed timer unless it's more than
+        // half elapsed — "lost" is still declared within ~60s of silence.
+        if let timer = signalTimer, timer.isValid,
+           timer.fireDate.timeIntervalSinceNow > signalTimeout / 2 {
+            return
+        }
         signalTimer?.invalidate()
         signalTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false, block: { [weak self] _ in
             guard let self = self else { return }
             print("Device is lost")
+            self.lastReportedRSSI = nil
             self.delegate?.updateRSSI(rssi: nil, active: false)
             if self.presence {
                 self.presence = false
@@ -231,28 +263,37 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
     
-    func getEstimatedRSSI(rssi: Int) -> Int {
-        if latestRSSIs.count >= latestN {
-            latestRSSIs.removeFirst()
+    func reportRSSI(_ estimatedRSSI: Int, active: Bool, now: Double) {
+        // The menu title is the only consumer; refreshing it on every
+        // advertisement (~10Hz) churns AppKit for no visible benefit.
+        // Report on mode change, on movement >= 2dB, or at least once a second.
+        if active == lastReportedActive, let last = lastReportedRSSI,
+           abs(estimatedRSSI - last) < 2, now - lastReportAt < 1.0 {
+            return
         }
-        latestRSSIs.append(Double(rssi))
-        var mean: Double = 0.0
-        var sddev: Double = 0.0
-        vDSP_normalizeD(latestRSSIs, 1, nil, 1, &mean, &sddev, vDSP_Length(latestRSSIs.count))
-        return Int(mean)
+        lastReportedRSSI = estimatedRSSI
+        lastReportedActive = active
+        lastReportAt = now
+        delegate?.updateRSSI(rssi: estimatedRSSI, active: active)
     }
 
     func updateMonitoredPeripheral(_ rssi: Int) {
-        // print(String(format: "rssi: %d", rssi))
-        if rssi >= (unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI) && !presence {
+        // Invalid samples (hardware glitches) must not move the filter or
+        // extend presence. Callers pre-validate; this is defense in depth.
+        guard RSSIFilter.isValidSample(rssi) else { return }
+        let now = Date().timeIntervalSince1970
+
+        let estimatedRSSI = rssiFilter.addSample(rssi, at: now)
+        lastEstimatedRSSI = estimatedRSSI
+        reportRSSI(estimatedRSSI, active: activeModeTimer != nil, now: now)
+
+        // Both directions use the *filtered* value: unlocking on a single raw
+        // spike while locking on the average caused flapping at the boundary.
+        if estimatedRSSI >= (unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI) && !presence {
             print("Device is close")
             presence = true
             delegate?.updatePresence(presence: presence, reason: "close")
-            latestRSSIs.removeAll() // Avoid bouncing
         }
-
-        let estimatedRSSI = getEstimatedRSSI(rssi: rssi)
-        delegate?.updateRSSI(rssi: estimatedRSSI, active: activeModeTimer != nil)
 
         if estimatedRSSI >= (lockRSSI == LOCK_DISABLED ? unlockRSSI : lockRSSI) {
             if let timer = proximityTimer {
@@ -275,6 +316,12 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func resetScanTimer(device: Device) {
+        // Same churn avoidance as resetSignalTimer: advertisements arrive
+        // continuously, so keep the armed eviction timer while it's fresh.
+        if let timer = device.scanTimer, timer.isValid,
+           timer.fireDate.timeIntervalSinceNow > signalTimeout / 2 {
+            return
+        }
         device.scanTimer?.invalidate()
         // Weak captures: the run loop retains the timer and the device retains
         // the timer, so strong captures would pin both until firing.
@@ -320,15 +367,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber)
     {
-        let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
+        let rawRSSI = RSSI.intValue
+        let rssiValid = RSSIFilter.isValidSample(rawRSSI)
         if let uuid = monitoredUUID {
             if peripheral.identifier.description == uuid.description {
                 if monitoredPeripheral == nil {
                     monitoredPeripheral = peripheral
                 }
-                if activeModeTimer == nil {
-                    //print("Discover \(rssi)dBm")
-                    updateMonitoredPeripheral(rssi)
+                if activeModeTimer == nil && rssiValid {
+                    //print("Discover \(rawRSSI)dBm")
+                    updateMonitoredPeripheral(rawRSSI)
                     if !passiveMode {
                         connectMonitoredPeripheral()
                     }
@@ -345,29 +393,27 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     }
                 }
             }
-            let dev = devices[peripheral.identifier]
-            var device: Device
-            if (dev == nil) {
-                device = Device(uuid: peripheral.identifier)
-                if (rssi >= thresholdRSSI) {
-                    device.peripheral = peripheral
-                    device.rssi = rssi
-                    device.advData = advertisementData["kCBAdvDataManufacturerData"] as? Data
-                    devices[peripheral.identifier] = device
-                    central.connect(peripheral, options: nil)
-                    delegate?.newDevice(device: device)
-                }
-            } else {
-                device = dev!
+            if let device = devices[peripheral.identifier] {
                 // Duplicate advertisements arrive continuously; the menu title
                 // only shows the RSSI, so skip the (expensive) UI refresh when
                 // nothing changed. The eviction timer is still reset below.
-                if device.rssi != rssi {
-                    device.rssi = rssi
+                if rssiValid && device.rssi != rawRSSI {
+                    device.rssi = rawRSSI
                     delegate?.updateDevice(device: device)
                 }
+                resetScanTimer(device: device)
+            } else if rssiValid && rawRSSI >= thresholdRSSI {
+                // Bogus readings (e.g. positive values some stacks report on
+                // error) must not pass the threshold gate or pollute the list.
+                let device = Device(uuid: peripheral.identifier)
+                device.peripheral = peripheral
+                device.rssi = rawRSSI
+                device.advData = advertisementData["kCBAdvDataManufacturerData"] as? Data
+                devices[peripheral.identifier] = device
+                central.connect(peripheral, options: nil)
+                delegate?.newDevice(device: device)
+                resetScanTimer(device: device)
             }
-            resetScanTimer(device: device)
         }
     }
 
@@ -392,7 +438,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard peripheral == monitoredPeripheral else { return }
-        let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
+        // On error the value is garbage; feeding it to the filter would
+        // swing the estimate and flap presence.
+        guard error == nil, RSSIFilter.isValidSample(RSSI.intValue) else { return }
+        let rssi = RSSI.intValue
         //print("readRSSI \(rssi)dBm")
         updateMonitoredPeripheral(rssi)
         lastReadAt = Date().timeIntervalSince1970
@@ -402,24 +451,49 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             if !scanMode {
                 centralMgr.stopScan()
             }
-            activeModeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true, block: { [weak self, weak peripheral] timer in
-                guard let self = self, let peripheral = peripheral else {
-                    timer.invalidate()
-                    return
-                }
-                if Date().timeIntervalSince1970 > self.lastReadAt + 10 {
-                    print("Falling back to passive mode")
-                    self.centralMgr.cancelPeripheralConnection(peripheral)
-                    self.activeModeTimer?.invalidate()
-                    self.activeModeTimer = nil
-                    self.scanForPeripherals()
-                } else if peripheral.state == .connected {
-                    peripheral.readRSSI()
-                } else {
-                    self.connectMonitoredPeripheral()
-                }
-            })
-            RunLoop.main.add(activeModeTimer!, forMode: .common)
+            scheduleActivePoll()
+        }
+    }
+
+    /// Poll fast near a lock/unlock decision boundary, slow when far away to
+    /// save radio/power. Fixed 2s polling was both wasteful (far) and slow
+    /// (at the boundary).
+    func activePollInterval() -> TimeInterval {
+        guard let estimated = lastEstimatedRSSI else { return 2.0 }
+        let unlockThreshold = unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI
+        let lockThreshold = lockRSSI == LOCK_DISABLED ? unlockRSSI : lockRSSI
+        let margin = min(abs(estimated - unlockThreshold), abs(estimated - lockThreshold))
+        if margin <= 5 { return 1.0 }
+        if margin <= 10 { return 2.0 }
+        return 5.0
+    }
+
+    func scheduleActivePoll() {
+        activeModeTimer?.invalidate()
+        activeModeTimer = Timer.scheduledTimer(withTimeInterval: activePollInterval(), repeats: false, block: { [weak self] timer in
+            guard let self = self else { return }
+            guard let peripheral = self.monitoredPeripheral else {
+                timer.invalidate()
+                self.activeModeTimer = nil
+                self.scanForPeripherals()
+                return
+            }
+            if Date().timeIntervalSince1970 > self.lastReadAt + 10 {
+                print("Falling back to passive mode")
+                self.centralMgr.cancelPeripheralConnection(peripheral)
+                self.activeModeTimer?.invalidate()
+                self.activeModeTimer = nil
+                self.scanForPeripherals()
+            } else if peripheral.state == .connected {
+                peripheral.readRSSI()
+                self.scheduleActivePoll()
+            } else {
+                self.connectMonitoredPeripheral()
+                self.scheduleActivePoll()
+            }
+        })
+        if let timer = activeModeTimer {
+            RunLoop.main.add(timer, forMode: .common)
         }
     }
 

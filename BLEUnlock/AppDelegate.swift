@@ -1,13 +1,39 @@
 import Cocoa
 import Quartz
 import ServiceManagement
+import UserNotifications
 
 func t(_ key: String) -> String {
     return NSLocalizedString(key, comment: "")
 }
 
+enum AppNotification {
+    case locked(reason: String)
+    case updateAvailable
+}
+
+/// Single choke point for user-visible notifications (replaces the deprecated
+/// NSUserNotification API). Identifiers are fixed per kind so a newer event
+/// replaces the older one and unlock can clear a stale lock notice.
+func postAppNotification(_ kind: AppNotification) {
+    let content = UNMutableNotificationContent()
+    content.title = "BLEUnlock"
+    let identifier: String
+    switch kind {
+    case .locked(let reason):
+        identifier = "device-locked"
+        content.subtitle = reason == "lost" ? t("notification_lost_signal") : t("notification_device_away")
+        content.body = t("notification_locked")
+    case .updateAvailable:
+        identifier = "update-available"
+        content.subtitle = t("notification_update_available")
+        content.userInfo = ["url": "https://github.com/ts1/BLEUnlock/releases"]
+    }
+    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+}
+
 @NSApplicationMain
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation, NSUserNotificationCenterDelegate, BLEDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation, UNUserNotificationCenterDelegate, BLEDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let ble = BLE()
     let mainMenu = NSMenu()
@@ -22,10 +48,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     var displaySleep = false
     var systemSleep = false
     var connected = false
-    var userNotification: NSUserNotification?
     var nowPlayingWasPlaying = false
     var aboutBox: AboutBox? = nil
     var wakeTimer: Timer?
+    var wakeRetryCount = 0
     var manualLock = false
     var unlockedAt = 0.0
     var inScreensaver = false
@@ -138,30 +164,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     func notifyUser(_ reason: String) {
-        let un = NSUserNotification()
-        un.title = "BLEUnlock"
-        if reason == "lost" {
-            un.subtitle = t("notification_lost_signal")
-        } else if reason == "away" {
-            un.subtitle = t("notification_device_away")
-        }
-        un.informativeText = t("notification_locked")
-        un.deliveryDate = Date().addingTimeInterval(1)
-        NSUserNotificationCenter.default.scheduleNotification(un)
-        userNotification = un
+        postAppNotification(.locked(reason: reason))
     }
 
-    func userNotificationCenter(_ center: NSUserNotificationCenter,
-                                shouldPresent notification: NSUserNotification) -> Bool {
-        return true
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
     }
 
-    func userNotificationCenter(_ center: NSUserNotificationCenter,
-                                didActivate notification: NSUserNotification) {
-        if notification != userNotification {
-            NSWorkspace.shared.open(URL(string: "https://github.com/ts1/BLEUnlock/releases")!)
-            NSUserNotificationCenter.default.removeDeliveredNotification(notification)
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let urlString = response.notification.request.content.userInfo["url"] as? String,
+           let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
         }
+        completionHandler()
     }
 
     func runScript(_ arg: String) {
@@ -219,14 +238,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     func updatePresence(presence: Bool, reason: String) {
         if presence {
             if ble.unlockRSSI != ble.UNLOCK_DISABLED {
-                if let un = userNotification {
-                    NSUserNotificationCenter.default.removeDeliveredNotification(un)
-                    userNotification = nil
-                }
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["device-locked"])
                 if displaySleep && !systemSleep && prefs.bool(forKey: "wakeOnProximity") {
                     print("Waking display")
                     wakeDisplay()
-                    wakeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true, block: { _ in
+                    wakeRetryCount = 0
+                    wakeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true, block: { [weak self] _ in
+                        guard let self = self else { return }
+                        // A display that never wakes must not spin this timer forever.
+                        self.wakeRetryCount += 1
+                        if self.wakeRetryCount > 10 {
+                            print("Giving up waking display")
+                            self.wakeTimer?.invalidate()
+                            self.wakeTimer = nil
+                            return
+                        }
                         print("Retrying waking display")
                         wakeDisplay()
                     })
@@ -254,6 +280,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             let pressEvent = CGEvent(keyboardEventSource: src, virtualKey: 49, keyDown: true)
             let len = offset + PER < uniCharCount ? PER : uniCharCount - offset
             let buffer = UnsafeMutablePointer<UniChar>.allocate(capacity: len)
+            defer { buffer.deallocate() }
             for i in 0..<len {
                 buffer[i] = string.utf16[strIndex]
                 strIndex = string.utf16.index(after: strIndex)
@@ -312,6 +339,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         displaySleep = false
         wakeTimer?.invalidate()
         wakeTimer = nil
+        wakeRetryCount = 0
         tryUnlockScreen()
     }
 
@@ -706,7 +734,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             ble.proximityTimeout = Double(lockDelay)
         }
 
-        NSUserNotificationCenter.default.delegate = self
+        let unc = UNUserNotificationCenter.current()
+        unc.delegate = self
+        unc.requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         let nc = NSWorkspace.shared.notificationCenter;
         nc.addObserver(self, selector: #selector(onDisplaySleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
