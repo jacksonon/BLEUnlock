@@ -52,6 +52,9 @@ class Device: NSObject {
     var scanTimer: Timer?
     var macAddr: String?
     var blName: String?
+    // Advertised TxPower (dBm) when the peripheral includes it; enables the
+    // display-only distance estimate. Nil when unknown.
+    var txPower: Int?
     // Outstanding DeviceInformation reads; when it drains to zero the GATT
     // connection has served its purpose and can be dropped (see BLE).
     var pendingInfoReads = 0
@@ -138,9 +141,10 @@ protocol BLEDelegate {
     func newDevice(device: Device)
     func updateDevice(device: Device)
     func removeDevice(device: Device)
-    func updateRSSI(rssi: Int?, active: Bool)
+    func updateRSSI(rssi: Int?, active: Bool, distance: Double?)
     func updatePresence(presence: Bool, reason: String)
     func bluetoothPowerWarn()
+    func calibrationDidFinish(baseRSSI: Int?)
 }
 
 class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
@@ -157,6 +161,15 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var presence = false
     var lockRSSI = -80
     var unlockRSSI = -60
+    /// Effective thresholds: the globals shifted by the monitored device's
+    /// 1m calibration (0 when uncalibrated), so one dBm setting means the
+    /// same physical distance across devices.
+    var unlockThreshold: Int {
+        (unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI) + calibratedOffset
+    }
+    var lockThreshold: Int {
+        (lockRSSI == LOCK_DISABLED ? unlockRSSI : lockRSSI) + calibratedOffset
+    }
     var proximityTimeout = 5.0
     var signalTimeout = 60.0
     var lastReadAt = 0.0
@@ -169,6 +182,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var lastReportedRSSI: Int? = nil
     var lastReportedActive = false
     var lastReportAt = 0.0
+    var monitoredTxPower: Int? = nil
+    var lastDistance: Double? = nil
+    // Per-device 1m calibration: the global dBm thresholds shift by this
+    // offset (measured@1m minus the -59dBm reference). 0 when uncalibrated.
+    var calibratedOffset = 0
+    let calibrationReferenceRSSI = -59
+    var calibrating = false
+    var calibrationSamples: [Int] = []
+    var calibrationTimer: Timer?
+    let calibrationDuration = 8.0
     var activeModeTimer : Timer? = nil
     var connectionTimer : Timer? = nil
 
@@ -221,6 +244,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         rssiFilter.reset()
         lastEstimatedRSSI = nil
         lastReportedRSSI = nil
+        cancelCalibration()
+        calibratedOffset = 0
+        monitoredTxPower = nil
+        lastDistance = nil
         scanForPeripherals()
     }
 
@@ -237,7 +264,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             guard let self = self else { return }
             print("Device is lost")
             self.lastReportedRSSI = nil
-            self.delegate?.updateRSSI(rssi: nil, active: false)
+            self.delegate?.updateRSSI(rssi: nil, active: false, distance: nil)
             if self.presence {
                 self.presence = false
                 self.delegate?.updatePresence(presence: self.presence, reason: "lost")
@@ -264,7 +291,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             // Sync the menu out of its stale connected state. Deliberately
             // not a presence event: toggling Bluetooth off must not lock.
             lastReportedRSSI = nil
-            delegate?.updateRSSI(rssi: nil, active: false)
+            delegate?.updateRSSI(rssi: nil, active: false, distance: nil)
             if powerWarn {
                 powerWarn = false
                 delegate?.bluetoothPowerWarn()
@@ -274,7 +301,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
     
-    func reportRSSI(_ estimatedRSSI: Int, active: Bool, now: Double) {
+    func reportRSSI(_ estimatedRSSI: Int, active: Bool, distance: Double?, now: Double) {
         // The menu title is the only consumer; refreshing it on every
         // advertisement (~10Hz) churns AppKit for no visible benefit.
         // Report on mode change, on movement >= 2dB, or at least once a second.
@@ -285,7 +312,40 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         lastReportedRSSI = estimatedRSSI
         lastReportedActive = active
         lastReportAt = now
-        delegate?.updateRSSI(rssi: estimatedRSSI, active: active)
+        delegate?.updateRSSI(rssi: estimatedRSSI, active: active, distance: distance)
+    }
+
+    func beginCalibration() {
+        // Collect raw valid samples for a fixed window, then report their
+        // mean as "RSSI at 1m". Stand 1m from the Mac while this runs.
+        guard monitoredUUID != nil else { return }
+        cancelCalibration()
+        calibrating = true
+        calibrationTimer = Timer.scheduledTimer(withTimeInterval: calibrationDuration, repeats: false, block: { [weak self] _ in
+            self?.finishCalibration()
+        })
+        if let timer = calibrationTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    func cancelCalibration() {
+        calibrationTimer?.invalidate()
+        calibrationTimer = nil
+        calibrating = false
+        calibrationSamples = []
+    }
+
+    func finishCalibration() {
+        calibrationTimer = nil
+        calibrating = false
+        let samples = calibrationSamples
+        calibrationSamples = []
+        guard samples.count >= 3 else {
+            delegate?.calibrationDidFinish(baseRSSI: nil)
+            return
+        }
+        delegate?.calibrationDidFinish(baseRSSI: Int(Double(samples.reduce(0, +)) / Double(samples.count)))
     }
 
     func updateMonitoredPeripheral(_ rssi: Int) {
@@ -296,17 +356,25 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
         let estimatedRSSI = rssiFilter.addSample(rssi, at: now)
         lastEstimatedRSSI = estimatedRSSI
-        reportRSSI(estimatedRSSI, active: activeModeTimer != nil, now: now)
+        if calibrating {
+            calibrationSamples.append(rssi)
+        }
+        if let tx = monitoredTxPower {
+            lastDistance = RSSIFilter.distance(txPower: tx, rssi: estimatedRSSI)
+        } else {
+            lastDistance = nil
+        }
+        reportRSSI(estimatedRSSI, active: activeModeTimer != nil, distance: lastDistance, now: now)
 
         // Both directions use the *filtered* value: unlocking on a single raw
         // spike while locking on the average caused flapping at the boundary.
-        if estimatedRSSI >= (unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI) && !presence {
+        if estimatedRSSI >= unlockThreshold && !presence {
             print("Device is close")
             presence = true
             delegate?.updatePresence(presence: presence, reason: "close")
         }
 
-        if estimatedRSSI >= (lockRSSI == LOCK_DISABLED ? unlockRSSI : lockRSSI) {
+        if estimatedRSSI >= lockThreshold {
             if let timer = proximityTimer {
                 timer.invalidate()
                 print("Proximity timer canceled")
@@ -376,6 +444,12 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         RunLoop.main.add(connectionTimer!, forMode: .common)
     }
 
+    func txPower(from advertisementData: [String : Any]) -> Int? {
+        guard let tx = advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber,
+              RSSIFilter.validTxPowerRange.contains(tx.intValue) else { return nil }
+        return tx.intValue
+    }
+
     //MARK:- CBCentralManagerDelegate start
 
     func centralManager(_ central: CBCentralManager,
@@ -391,6 +465,9 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 // returning device; active polling and RSSI guards track this
                 // reference, so a stale one would silently drop updates.
                 monitoredPeripheral = peripheral
+                if let tx = txPower(from: advertisementData) {
+                    monitoredTxPower = tx
+                }
                 if activeModeTimer == nil && rssiValid {
                     //print("Discover \(rawRSSI)dBm")
                     updateMonitoredPeripheral(rawRSSI)
@@ -414,6 +491,9 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 // Duplicate advertisements arrive continuously; the menu title
                 // only shows the RSSI, so skip the (expensive) UI refresh when
                 // nothing changed. The eviction timer is still reset below.
+                if let tx = txPower(from: advertisementData) {
+                    device.txPower = tx
+                }
                 if rssiValid && device.rssi != rawRSSI {
                     device.rssi = rawRSSI
                     delegate?.updateDevice(device: device)
@@ -433,6 +513,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 let device = Device(uuid: peripheral.identifier)
                 device.peripheral = peripheral
                 device.rssi = rawRSSI
+                device.txPower = txPower(from: advertisementData)
                 device.advData = advertisementData["kCBAdvDataManufacturerData"] as? Data
                 devices[peripheral.identifier] = device
                 central.connect(peripheral, options: nil)
@@ -493,9 +574,9 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     /// save radio/power. Fixed 2s polling was both wasteful (far) and slow
     /// (at the boundary).
     func activePollInterval() -> TimeInterval {
+        // Calibrating? Sample fast regardless of margins to gather enough data.
+        if calibrating { return 1.0 }
         guard let estimated = lastEstimatedRSSI else { return 2.0 }
-        let unlockThreshold = unlockRSSI == UNLOCK_DISABLED ? lockRSSI : unlockRSSI
-        let lockThreshold = lockRSSI == LOCK_DISABLED ? unlockRSSI : lockRSSI
         let margin = min(abs(estimated - unlockThreshold), abs(estimated - lockThreshold))
         if margin <= 5 { return 1.0 }
         if margin <= 10 { return 2.0 }

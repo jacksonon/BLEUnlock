@@ -1,6 +1,10 @@
 "about" = "About BLEUnlock";
 "bluetooth_power_warn" = "Bluetooth is turned off. For BLEUnlock to work, turn it on.";
+"calibrate_1m" = "Calibrate at 1m…";
+"calibration_failed" = "Not enough samples. Stand 1m from the Mac and try again.";
+"calibration_result" = "Average RSSI at 1m: %ddBm. Thresholds shifted by %ddB.";
 "cancel" = "Cancel";
+"clear_calibration" = "Clear Calibration";
 "closer" = "⬆Closer";
 "device" = "Device";
 "device_not_set" = "Device not selected";

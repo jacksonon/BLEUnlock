@@ -99,6 +99,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             return menuItem.tag <= ble.unlockRSSI
         } else if menuItem.menu == unlockRSSIMenu {
             return menuItem.tag >= ble.lockRSSI
+        } else if menuItem.action == #selector(calibrate1m) {
+            return ble.monitoredUUID != nil
+        } else if menuItem.action == #selector(clearCalibration) {
+            return ble.monitoredUUID != nil && ble.calibratedOffset != 0
         }
         return true
     }
@@ -117,7 +121,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         } else {
             desc = device.description
         }
-        return String(format: "%@ (%ddBm)", desc, device.rssi)
+        var title = String(format: "%@ (%ddBm", desc, device.rssi)
+        if let tx = device.txPower {
+            title += " " + formatDistance(RSSIFilter.distance(txPower: tx, rssi: device.rssi))
+        }
+        return title + ")"
+    }
+
+    /// Display-only distance string. The estimate is rough (indoor multipath),
+    /// so cap it instead of showing absurd precision at range.
+    func formatDistance(_ d: Double) -> String {
+        if !d.isFinite || d < 0 {
+            return "?"
+        }
+        if d > 99 {
+            return ">99m"
+        }
+        return String(format: "≈%.1fm", d)
     }
     
     func newDevice(device: Device) {
@@ -141,10 +161,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         deviceDict.removeValue(forKey: device.uuid)
     }
 
-    func updateRSSI(rssi: Int?, active: Bool) {
+    func updateRSSI(rssi: Int?, active: Bool, distance: Double?) {
         if let r = rssi {
             lastRSSI = r
-            monitorMenuItem?.title = String(format:"%ddBm", r) + (active ? " (Active)" : "")
+            var title = String(format:"%ddBm", r)
+            if let d = distance {
+                title += " (" + formatDistance(d) + ")"
+            }
+            monitorMenuItem?.title = title + (active ? " (Active)" : "")
             if (!connected) {
                 connected = true
                 statusItem.button?.image = NSImage(named: "StatusBarConnected")
@@ -413,6 +437,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         statusItem.button?.image = NSImage(named: "StatusBarDisconnected")
         monitorMenuItem?.title = t("not_detected")
         ble.startMonitor(uuid: uuid)
+        ble.calibratedOffset = calibrationOffset(for: uuid)
+    }
+
+    /// Per-device 1m-calibration offset in dB (0 = uncalibrated).
+    func calibrationOffset(for uuid: UUID) -> Int {
+        guard let base = calibrationBase(for: uuid) else { return 0 }
+        return base - ble.calibrationReferenceRSSI
+    }
+
+    func calibrationBase(for uuid: UUID) -> Int? {
+        guard let dict = prefs.dictionary(forKey: "calibration") else { return nil }
+        guard let v = dict[uuid.uuidString] else { return nil }
+        if let i = v as? Int { return i }
+        return (v as? NSNumber)?.intValue
+    }
+
+    func setCalibrationBase(_ base: Int?, for uuid: UUID) {
+        var dict = prefs.dictionary(forKey: "calibration") ?? [:]
+        if let b = base {
+            dict[uuid.uuidString] = b
+        } else {
+            dict.removeValue(forKey: uuid.uuidString)
+        }
+        prefs.set(dict, forKey: "calibration")
+    }
+
+    func calibrationDidFinish(baseRSSI: Int?) {
+        guard let uuid = ble.monitoredUUID else { return }
+        guard let base = baseRSSI else {
+            errorModal(t("calibration_failed"))
+            return
+        }
+        let offset = base - ble.calibrationReferenceRSSI
+        setCalibrationBase(base, for: uuid)
+        ble.calibratedOffset = offset
+        errorModal(t("calibrate_1m"), info: String(format: t("calibration_result"), base, offset))
     }
 
     func errorModal(_ msg: String, info: String? = nil) {
@@ -533,6 +593,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         ble.unlockRSSI = value
     }
 
+    @objc func calibrate1m(_ menuItem: NSMenuItem) {
+        ble.beginCalibration()
+    }
+
+    @objc func clearCalibration(_ menuItem: NSMenuItem) {
+        guard let uuid = ble.monitoredUUID else { return }
+        setCalibrationBase(nil, for: uuid)
+        ble.calibratedOffset = 0
+    }
+
     @objc func setTimeout(_ menuItem: NSMenuItem) {
         let value = menuItem.tag
         prefs.set(value, forKey: "timeout")
@@ -606,6 +676,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     
     func constructMenu() {
         monitorMenuItem = mainMenu.addItem(withTitle: t("device_not_set"), action: nil, keyEquivalent: "")
+        mainMenu.delegate = self
         
         var item: NSMenuItem
 
@@ -628,6 +699,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         constructRSSIMenu(lockRSSIMenu, #selector(setLockRSSI))
         item = lockRSSIMenu.addItem(withTitle: t("disabled"), action: #selector(setLockRSSI), keyEquivalent: "")
         item.tag = ble.LOCK_DISABLED
+
+        mainMenu.addItem(withTitle: t("calibrate_1m"), action: #selector(calibrate1m), keyEquivalent: "")
+        mainMenu.addItem(withTitle: t("clear_calibration"), action: #selector(clearCalibration), keyEquivalent: "")
 
         let lockDelayItem = mainMenu.addItem(withTitle: t("lock_delay"), action: nil, keyEquivalent: "")
         lockDelayItem.submenu = lockDelayMenu

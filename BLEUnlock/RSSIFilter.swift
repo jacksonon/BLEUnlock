@@ -31,6 +31,16 @@ struct RSSIFilter {
         return validRange.contains(rssi)
     }
 
+    /// Plausible range for advertised TxPower, in dBm.
+    static let validTxPowerRange = -100...30
+
+    /// Rough distance estimate in meters (log-distance path loss model).
+    /// Display-only: indoor multipath makes this a trend indicator, not a
+    /// measurement — never feed it to lock/unlock decisions.
+    static func distance(txPower: Int, rssi: Int, pathExponent: Double = 2.0) -> Double {
+        return pow(10.0, Double(txPower - rssi) / (10.0 * pathExponent))
+    }
+
     private(set) var estimate: Double?
     private var lastSampleAt: TimeInterval = 0
 

@@ -1,6 +1,10 @@
 "about" = "BLEUnlock について";
 "bluetooth_power_warn" = "Bluetooth がオフになっています。 BLEUnlock を動作させるためにはオンにしてください。";
+"calibrate_1m" = "1mでキャリブレーション…";
+"calibration_failed" = "十分な信号が得られませんでした。Macから1mの位置でやり直してください。";
+"calibration_result" = "1mでの平均RSSI: %ddBm。しきい値を%ddB調整しました。";
 "cancel" = "キャンセル";
+"clear_calibration" = "キャリブレーションをクリア";
 "closer" = "⬆近い";
 "device" = "デバイス";
 "device_not_set" = "デバイス未選択";
