@@ -345,7 +345,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             delegate?.calibrationDidFinish(baseRSSI: nil)
             return
         }
-        delegate?.calibrationDidFinish(baseRSSI: Int(Double(samples.reduce(0, +)) / Double(samples.count)))
+        let mean = Int(Double(samples.reduce(0, +)) / Double(samples.count))
+        // Sanity: at a true 1m no phone/watch reads hotter than -50dBm or
+        // weaker than -80dBm. Outside that the user stood too close/far, and
+        // accepting it would shift thresholds into unreachable territory
+        // (an unlock level that can never fire) with zero feedback.
+        guard (-80 ... -50).contains(mean) else {
+            delegate?.calibrationDidFinish(baseRSSI: nil)
+            return
+        }
+        delegate?.calibrationDidFinish(baseRSSI: mean)
     }
 
     func updateMonitoredPeripheral(_ rssi: Int) {
