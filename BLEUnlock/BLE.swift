@@ -185,7 +185,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func stopScanning() {
         scanMode = false
-        if activeModeTimer != nil {
+        // In passive monitoring the scan must keep running to track the
+        // device; otherwise stop it — an idle duplicates scan with no
+        // monitored device is pure battery drain (e.g. menu opened once
+        // on a fresh install with nothing selected).
+        if activeModeTimer != nil || monitoredUUID == nil {
             centralMgr.stopScan()
         }
     }
@@ -257,6 +261,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             presence = false
             signalTimer?.invalidate()
             signalTimer = nil
+            // Sync the menu out of its stale connected state. Deliberately
+            // not a presence event: toggling Bluetooth off must not lock.
+            lastReportedRSSI = nil
+            delegate?.updateRSSI(rssi: nil, active: false)
             if powerWarn {
                 powerWarn = false
                 delegate?.bluetoothPowerWarn()
@@ -447,6 +455,15 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             connectionTimer = nil
             peripheral.readRSSI()
         }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didFailToConnect peripheral: CBPeripheral,
+                        error: Error?)
+    {
+        // Recovery is already covered (the active poll tick or the next
+        // advertisement reconnects); log so failures aren't silent.
+        print("Failed to connect to \(peripheral.identifier): \(error?.localizedDescription ?? "unknown error")")
     }
 
     //MARK:CBCentralManagerDelegate end -

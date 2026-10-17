@@ -49,7 +49,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     var systemSleep = false
     var connected = false
     var nowPlayingWasPlaying = false
-    var aboutBox: AboutBox? = nil
     var wakeTimer: Timer?
     var wakeRetryCount = 0
     var manualLock = false
@@ -193,7 +192,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         } else {
             process.arguments = [arg]
         }
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            print("Failed to run event script \(file.path): \(error)")
+        }
     }
 
     func pauseNowPlaying() {
@@ -759,8 +762,5 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         // This is required because we can't have LSUIElement set to true in Info.plist,
         // otherwise CBCentralManager.scanForPeripherals won't work.
         NSApp.setActivationPolicy(.accessory)
-    }
-    
-    func applicationWillTerminate(_ aNotification: Notification) {
     }
 }
